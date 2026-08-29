@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+.npm/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment and secrets (allow only the example template)
+.env
+.env.*
+!.env.example
+
+# Runtime & application data
+vault/
+**/.yaos-state
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDE & editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
