@@ -32,6 +32,7 @@ import {
 	isFileMetaDeleted,
 	isNestedFileMeta,
 	createNestedActiveMeta,
+	createNestedTombstoneMeta,
 	markMetaAsDeleted,
 	reviveMeta,
 } from "./fileMeta.js";
@@ -186,9 +187,11 @@ export class DiskMirror {
 			}
 		}
 
-		// Tombstone in CRDT (if it has an entry) — propagates deletion to all devices.
+		// Tombstone in CRDT (if it has an entry) — fully removes the artifact from
+		// the shared state (meta tombstone + pathToId + idToText), so it cannot be
+		// re-materialized and the deletion propagates to every device.
 		this.sync.ydoc.transact(() => {
-			this.tombstonePath(artifactPath, "keep-original");
+			this.deleteFileFromCrdt(artifactPath);
 			if (canonical !== artifactPath) {
 				// If we resolved toward the conflict, make sure the canonical is imported fresh.
 				if (decision === "keep-conflict") this.importFileIntoCrdt(canonical);
@@ -196,42 +199,22 @@ export class DiskMirror {
 		}, "resolve-conflict");
 
 		// Remove local copy so it disappears from disk too.
-		try {
-			unlinkSync(diskPath);
-			log.info(`✓ Resolved conflict artifact: ${artifactPath} (${decision})`);
-		} catch (err) {
-			log.error(`Failed to unlink ${artifactPath}:`, err);
+		// Note: the tombstone above may already have triggered disk materialization
+		// to delete this file (hence the existsSync guard to avoid a noisy ENOENT).
+		if (existsSync(diskPath)) {
+			try {
+				unlinkSync(diskPath);
+				log.info(`✓ Resolved conflict artifact: ${artifactPath} (${decision})`);
+			} catch (err) {
+				log.error(`Failed to unlink ${artifactPath}:`, err);
+			}
+		} else {
+			log.info(`✓ Resolved conflict artifact (already removed from disk): ${artifactPath} (${decision})`);
 		}
 
 		// Verify the canonical file still materializes.
 		if (decision === "keep-conflict" && canonical !== artifactPath) {
 			this.importFileIntoCrdt(canonical);
-		}
-	}
-
-	/** Tombstone a path in CRDT if it exists (marks its meta as deleted). */
-	private tombstonePath(vaultPath: string, origin: string): void {
-		const fileId = this.findFileIdByPath(vaultPath);
-		if (!fileId) {
-			log.debug(`No CRDT entry for ${vaultPath} — nothing to tombstone`);
-			return;
-		}
-		const rawMeta = this.sync.meta.get(fileId);
-		if (!rawMeta) return;
-		if (isNestedFileMeta(rawMeta)) {
-			const decoded = decodeFileMeta(rawMeta);
-			if (decoded && !isFileMetaDeleted(decoded)) {
-				markMetaAsDeleted(rawMeta, Date.now(), this.deviceName);
-				log.info(`→ Tombstoned: ${vaultPath}`);
-			}
-		} else {
-			const tombstone = new Y.Map<unknown>();
-			tombstone.set("path", vaultPath);
-			tombstone.set("deleted", true);
-			tombstone.set("deletedAt", Date.now());
-			if (this.deviceName) tombstone.set("device", this.deviceName);
-			this.sync.meta.set(fileId, tombstone);
-			log.info(`→ Tombstoned (v2→v3): ${vaultPath}`);
 		}
 	}
 
@@ -916,7 +899,7 @@ export class DiskMirror {
 		const fileId = this.findFileIdByPath(vaultPath);
 		if (!fileId) return; // unknown file
 
-		const { meta } = this.sync;
+		const { meta, pathToId, idToText } = this.sync;
 		const rawMeta = meta.get(fileId);
 		if (!rawMeta) return;
 
@@ -927,15 +910,16 @@ export class DiskMirror {
 				log.info(`→ Tombstoned: ${vaultPath}`);
 			}
 		} else {
-			// v2 flat — replace with nested tombstone
-			const tombstone = new Y.Map<unknown>();
-			tombstone.set("path", vaultPath);
-			tombstone.set("deleted", true);
-			tombstone.set("deletedAt", Date.now());
-			if (this.deviceName) tombstone.set("device", this.deviceName);
+			// v2 flat — replace with nested tombstone (deletedAt-only, like upstream)
+			const tombstone = createNestedTombstoneMeta(vaultPath, Date.now(), this.deviceName);
 			meta.set(fileId, tombstone);
 			log.info(`→ Tombstoned (v2→v3): ${vaultPath}`);
 		}
+
+		// Fully remove the entry from the shared index/text maps so the server
+		// cannot re-materialize it on the next sync (mirrors upstream handleDelete).
+		pathToId.delete(vaultPath);
+		idToText.delete(fileId);
 	}
 
 	/**

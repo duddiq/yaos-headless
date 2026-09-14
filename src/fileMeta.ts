@@ -152,7 +152,6 @@ export function createNestedTombstoneMeta(
 ): Y.Map<unknown> {
 	const map = new Y.Map<unknown>();
 	map.set("path", path);
-	map.set("deleted", true);
 	map.set("deletedAt", deletedAt);
 	if (device) {
 		map.set("device", device);
@@ -162,14 +161,21 @@ export function createNestedTombstoneMeta(
 
 /**
  * Update an existing nested Y.Map entry to mark it as deleted (tombstone).
+ *
+ * Mirrors upstream YAOS setMetaDeleted semantics: a document is considered
+ * deleted by the presence of a positive `deletedAt`. The `deleted` flag is
+ * removed (not set to true) and stale `mtime` is cleared, matching how the
+ * YAOS server interprets tombstones. This is essential so the server does not
+ * re-materialize the file on the next sync.
  */
 export function markMetaAsDeleted(
 	metaEntry: Y.Map<unknown>,
 	deletedAt: number,
 	device?: string,
 ): void {
-	metaEntry.set("deleted", true);
 	metaEntry.set("deletedAt", deletedAt);
+	metaEntry.delete("deleted");
+	metaEntry.delete("mtime");
 	if (device) {
 		metaEntry.set("device", device);
 	}
