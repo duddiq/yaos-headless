@@ -20,6 +20,10 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Deployment artifacts specific to this LXC host (Hermes)
+vault-watcher.mjs
+yaos-headless.service
+
 # IDE & editors
 .vscode/
 .idea/

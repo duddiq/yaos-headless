@@ -20,6 +20,7 @@ import {
 	unlinkSync,
 	existsSync,
 	mkdirSync,
+	readdirSync,
 } from "node:fs";
 import { join, dirname, relative, extname } from "node:path";
 import { diff_match_patch as DiffMatchPatch } from "diff-match-patch";
@@ -31,10 +32,11 @@ import {
 	isFileMetaDeleted,
 	isNestedFileMeta,
 	createNestedActiveMeta,
+	createNestedTombstoneMeta,
 	markMetaAsDeleted,
 	reviveMeta,
 } from "./fileMeta.js";
-import { sha256Hex, sha256HexBuffer, randomId, normalizePath, isMdFile, guessMime } from "./utils.js";
+import { sha256Hex, sha256HexBuffer, randomId, normalizePath, isMdFile, guessMime, isConflictArtifactPath } from "./utils.js";
 import { BlobHttpClient } from "./blobClient.js";
 
 const log = createLogger("disk");
@@ -118,6 +120,102 @@ export class DiskMirror {
 
 		// 3. Watch filesystem for local changes (disk → CRDT)
 		this.startFileWatcher();
+	}
+
+	// ─── Conflict-artifact helpers (used by Hermes / daily scan) ──────────────
+
+	/**
+	 * List conflict artifacts currently present on disk (local safety copies that
+	 * YAOS wrote during reconciliation). They ARE visible to Hermes here, but are
+	 * distinct from the canonical document by filename.
+	 */
+	listConflictArtifacts(): string[] {
+		const artifacts: string[] = [];
+		const walk = (dir: string) => {
+			for (const entry of readdirSync(dir, { withFileTypes: true })) {
+				const full = join(dir, entry.name);
+				if (entry.isDirectory()) {
+					if (entry.name.startsWith(".")) continue; // dotfiles / config
+					walk(full);
+				} else if (isConflictArtifactPath(relative(this.syncDir, full))) {
+					artifacts.push(normalizePath(relative(this.syncDir, full)));
+				}
+			}
+		};
+		if (existsSync(this.syncDir)) walk(this.syncDir);
+		return artifacts.sort();
+	}
+
+	/**
+	 * Resolve a conflict artifact.
+	 *
+	 * This is the CRDT-aware deletion Hermes should use instead of a bare `rm`:
+	 * it tombstones the document in the CRDT so the deletion propagates to every
+	 * device, removing the copy from the shared state so it cannot re-materialize.
+	 *
+	 * @param artifactPath  vault-relative path of the conflict artifact
+	 * @param decision      what to do with the canonical (original) document:
+	 *    - "keep-original":  keep original, delete only the artifact (default)
+	 *    - "keep-conflict":  overwrite original with the artifact's content, then delete artifact
+	 */
+	resolveConflictArtifact(artifactPath: string, decision: "keep-original" | "keep-conflict" = "keep-original"): void {
+		const diskPath = join(this.syncDir, artifactPath);
+		if (!existsSync(diskPath)) {
+			log.warn(`Conflict artifact not found on disk: ${artifactPath}`);
+			return;
+		}
+
+		// Derive canonical path: strip " (YAOS conflict ...) from <device> <stamp>).md"
+		const canonical = artifactPath
+			.replace(/\s*\(YAOS conflict(?: - (?:crdt|disk|editor))? from .+ \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)(?: \d+)?\.md$/u, ".md");
+
+		if (decision === "keep-conflict" && canonical !== artifactPath) {
+			const canonicalDisk = join(this.syncDir, canonical);
+			try {
+				const conflictContent = readFileSync(diskPath, "utf8");
+				if (existsSync(canonicalDisk)) {
+					writeFileSync(canonicalDisk, conflictContent);
+				} else {
+					const dir = dirname(canonicalDisk);
+					if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+					writeFileSync(canonicalDisk, conflictContent);
+				}
+				log.info(`→ Overwrote canonical ${canonical} with conflict content`);
+			} catch (err) {
+				log.error(`Failed to keep-conflict for ${artifactPath}:`, err);
+				return;
+			}
+		}
+
+		// Tombstone in CRDT (if it has an entry) — fully removes the artifact from
+		// the shared state (meta tombstone + pathToId + idToText), so it cannot be
+		// re-materialized and the deletion propagates to every device.
+		this.sync.ydoc.transact(() => {
+			this.deleteFileFromCrdt(artifactPath);
+			if (canonical !== artifactPath) {
+				// If we resolved toward the conflict, make sure the canonical is imported fresh.
+				if (decision === "keep-conflict") this.importFileIntoCrdt(canonical);
+			}
+		}, "resolve-conflict");
+
+		// Remove local copy so it disappears from disk too.
+		// Note: the tombstone above may already have triggered disk materialization
+		// to delete this file (hence the existsSync guard to avoid a noisy ENOENT).
+		if (existsSync(diskPath)) {
+			try {
+				unlinkSync(diskPath);
+				log.info(`✓ Resolved conflict artifact: ${artifactPath} (${decision})`);
+			} catch (err) {
+				log.error(`Failed to unlink ${artifactPath}:`, err);
+			}
+		} else {
+			log.info(`✓ Resolved conflict artifact (already removed from disk): ${artifactPath} (${decision})`);
+		}
+
+		// Verify the canonical file still materializes.
+		if (decision === "keep-conflict" && canonical !== artifactPath) {
+			this.importFileIntoCrdt(canonical);
+		}
 	}
 
 	/** Stop all observers and watchers. */
@@ -639,6 +737,17 @@ export class DiskMirror {
 		// Skip dotfiles and state file
 		if (vaultPath.startsWith(".")) return;
 
+		// ── Conflict-artifact guard (mirrors upstream YAOS) ──────────────
+		// Conflict safety copies are local-only; they must never enter the
+		// CRDT so they don't propagate to other devices and re-appear after
+		// deletion.  We still allow "unlink" events through so that when
+		// resolveConflictArtifact removes the file from disk, the watcher
+		// doesn't try to re-process it.
+		if (action === "change" && isConflictArtifactPath(vaultPath)) {
+			log.debug(`Skipped conflict artifact (not importing to CRDT): ${vaultPath}`);
+			return;
+		}
+
 		// Check write-suppression
 		if (action === "change" && this.shouldSuppressChange(vaultPath, ext === ".md")) {
 			log.debug(`Suppressed echo for: ${vaultPath}`);
@@ -731,6 +840,13 @@ export class DiskMirror {
 
 	/** Import a disk file into the CRDT. */
 	private importFileIntoCrdt(vaultPath: string): void {
+		// Conflict artifacts are local-only safety copies — never import
+		// them into the CRDT (mirrors upstream YAOS behaviour).
+		if (isConflictArtifactPath(vaultPath)) {
+			log.debug(`Skipped conflict artifact import: ${vaultPath}`);
+			return;
+		}
+
 		const diskPath = join(this.syncDir, vaultPath);
 
 		let content: string;
@@ -801,7 +917,7 @@ export class DiskMirror {
 		const fileId = this.findFileIdByPath(vaultPath);
 		if (!fileId) return; // unknown file
 
-		const { meta } = this.sync;
+		const { meta, pathToId, idToText } = this.sync;
 		const rawMeta = meta.get(fileId);
 		if (!rawMeta) return;
 
@@ -812,15 +928,16 @@ export class DiskMirror {
 				log.info(`→ Tombstoned: ${vaultPath}`);
 			}
 		} else {
-			// v2 flat — replace with nested tombstone
-			const tombstone = new Y.Map<unknown>();
-			tombstone.set("path", vaultPath);
-			tombstone.set("deleted", true);
-			tombstone.set("deletedAt", Date.now());
-			if (this.deviceName) tombstone.set("device", this.deviceName);
+			// v2 flat — replace with nested tombstone (deletedAt-only, like upstream)
+			const tombstone = createNestedTombstoneMeta(vaultPath, Date.now(), this.deviceName);
 			meta.set(fileId, tombstone);
 			log.info(`→ Tombstoned (v2→v3): ${vaultPath}`);
 		}
+
+		// Fully remove the entry from the shared index/text maps so the server
+		// cannot re-materialize it on the next sync (mirrors upstream handleDelete).
+		pathToId.delete(vaultPath);
+		idToText.delete(fileId);
 	}
 
 	/**

@@ -22,6 +22,13 @@ async function main(): Promise<void> {
 	const config = loadConfig();
 	setLogLevel(config.logLevel);
 
+	// Parse CLI arguments
+	const args = process.argv.slice(2);
+	const listConflicts = args.includes("--list-conflicts");
+	const resolveIdx = args.indexOf("--resolve-conflict");
+	const resolvePath = resolveIdx >= 0 ? args[resolveIdx + 1] : undefined;
+	const keepConflict = args.includes("--keep-conflict");
+
 	log.info("╔═══════════════════════════════════════════════╗");
 	log.info("║       YAOS Headless Sync Client v1.0.0        ║");
 	log.info("╚═══════════════════════════════════════════════╝");
@@ -94,6 +101,34 @@ async function main(): Promise<void> {
 			process.exit(1);
 		}
 		log.warn("Initial sync timed out — starting in offline mode with cached state");
+	}
+
+	// One-shot conflict operations (no long-running watcher)
+	if (listConflicts) {
+		diskMirror.start();
+		const artifacts = diskMirror.listConflictArtifacts();
+		if (artifacts.length === 0) {
+			console.log("NO_CONFLICTS");
+		} else {
+			console.log(JSON.stringify(artifacts, null, 2));
+		}
+		await shutdown("done");
+		return;
+	}
+
+	if (resolvePath) {
+		diskMirror.start();
+		// Give the disk mirror a moment to materialize from CRDT before resolving
+		await new Promise((r) => setTimeout(r, 1000));
+		diskMirror.resolveConflictArtifact(
+			resolvePath,
+			keepConflict ? "keep-conflict" : "keep-original",
+		);
+		// Let the tombstone propagate to the server
+		await new Promise((r) => setTimeout(r, 2000));
+		await sync.destroy();
+		console.log("RESOLVED");
+		return;
 	}
 
 	// Start bidirectional disk synchronization
