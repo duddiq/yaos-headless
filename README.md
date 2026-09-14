@@ -147,6 +147,33 @@ npm run build
 npm start
 ```
 
+### Conflict-artifact CLI
+
+YAOS reconciliation can write sibling safety copies like
+`Note (YAOS conflict - crdt from Device 2026-01-01T00-00-00Z).md` when CRDT and
+disk disagree. These are detected and surfaced by the client, but resolving them
+should go through the CRDT (tombstone) so the deletion propagates to every device
+instead of re-materializing.
+
+> The long-running daemon and the one-shot conflict commands both connect to the
+> same CF Worker. Stop the daemon service before running a conflict command, or
+> they will both sync the same vault.
+
+```bash
+# List conflict artifacts currently on disk (JSON array or NO_CONFLICTS)
+node dist/index.js --list-conflicts
+
+# Keep the original note, delete only the conflict artifact (tombstone in CRDT)
+node dist/index.js --resolve-conflict "Note (YAOS conflict - crdt from Device 2026-01-01T00-00-00Z).md"
+
+# Overwrite the original with the conflict-copy content, then delete the artifact
+node dist/index.js --resolve-conflict "Note (YAOS conflict - disk from Device 2026-01-01T00-00-00Z).md" --keep-conflict
+```
+
+The conflict artifact is treated as a **local-only safety copy**: it is surfaced
+to operators (e.g. an AI agent) for review, but the canonical document is the one
+without the ` (YAOS conflict ...)` suffix.
+
 ---
 
 ## 🛠️ Production Deployments

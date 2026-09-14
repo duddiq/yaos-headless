@@ -52,6 +52,27 @@ export function isMdFile(vaultPath: string): boolean {
 }
 
 /**
+ * Conflict-artifact identity (mirrors upstream YAOS).
+ *
+ * YAOS writes sibling safety copies when reconciliation hits a conflict
+ * between CRDT and disk. They look like:
+ *   `<base> (YAOS conflict[- crdt|disk|editor] from <device> <stamp>)[ N].md`
+ *
+ * These are local-only safety copies. In upstream they never enter the CRDT.
+ * yaos-headless must recognize them so callers can decide: surface them to the
+ * user for review (Hermes), but never treat them as the canonical document.
+ */
+export function isConflictArtifactPath(vaultPath: string): boolean {
+	const normalized = vaultPath.replace(/\\/g, "/");
+	const name = normalized.slice(normalized.lastIndexOf("/") + 1);
+	return CONFLICT_ARTIFACT_RE.test(name);
+}
+
+/** Regex mirroring upstream YAOS src/sync/markdownConflictArtifact.ts */
+const CONFLICT_ARTIFACT_RE =
+	/ \(YAOS conflict(?: - (?:crdt|disk|editor))? from .+ \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)(?: \d+)?\.md$/u;
+
+/**
  * Guess MIME type from file extension.
  * Covers common attachment types in Obsidian vaults.
  */
