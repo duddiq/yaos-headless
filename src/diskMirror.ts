@@ -737,6 +737,17 @@ export class DiskMirror {
 		// Skip dotfiles and state file
 		if (vaultPath.startsWith(".")) return;
 
+		// ── Conflict-artifact guard (mirrors upstream YAOS) ──────────────
+		// Conflict safety copies are local-only; they must never enter the
+		// CRDT so they don't propagate to other devices and re-appear after
+		// deletion.  We still allow "unlink" events through so that when
+		// resolveConflictArtifact removes the file from disk, the watcher
+		// doesn't try to re-process it.
+		if (action === "change" && isConflictArtifactPath(vaultPath)) {
+			log.debug(`Skipped conflict artifact (not importing to CRDT): ${vaultPath}`);
+			return;
+		}
+
 		// Check write-suppression
 		if (action === "change" && this.shouldSuppressChange(vaultPath, ext === ".md")) {
 			log.debug(`Suppressed echo for: ${vaultPath}`);
@@ -829,6 +840,13 @@ export class DiskMirror {
 
 	/** Import a disk file into the CRDT. */
 	private importFileIntoCrdt(vaultPath: string): void {
+		// Conflict artifacts are local-only safety copies — never import
+		// them into the CRDT (mirrors upstream YAOS behaviour).
+		if (isConflictArtifactPath(vaultPath)) {
+			log.debug(`Skipped conflict artifact import: ${vaultPath}`);
+			return;
+		}
+
 		const diskPath = join(this.syncDir, vaultPath);
 
 		let content: string;
